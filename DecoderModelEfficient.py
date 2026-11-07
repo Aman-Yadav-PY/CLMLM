@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 
 
-
 class RotatoryPositionalEncoding(nn.Module):
 
     def __init__(self, d_model, max_len = 50000):
@@ -19,9 +18,9 @@ class RotatoryPositionalEncoding(nn.Module):
         cos, sin = self.cos[:T], self.sin[:T]
 
         X, Y = x[..., 0::2], x[..., 1::2] # x-ords, y-ords for every token
-     
-        Xn =  X * cos[:T] + Y * sin[:T] # [ cosQ sinQ ]  [X]
-        Yn = -X * sin[:T] + Y * cos[:T] # [-sinQ cosQ ] [Y]
+
+        Xn =  X * cos[:T] - Y * sin[:T] # [ cosQ -sinQ ]  [X]
+        Yn =  X * sin[:T] + Y * cos[:T] # [ sinQ cosQ ] [Y]
         
         out = torch.empty_like(x)
         out[..., 0::2] = Xn
@@ -34,39 +33,43 @@ class GroupedQueryAttention(nn.Module):
 
     def __init__(self, block_size, d_model, heads, groups, dropout):
         super().__init__()
+        assert d_model % heads == 0 and heads % groups == 0, "Error: Check d_model, heads, groups size."
         
         self.hs = d_model // heads
         self.rps = heads // groups
+        self.H = heads
+        self.G = groups
         
-        self.Wqs = nn.ModuleList([nn.Linear(d_model, self.hs) for _ in range(heads)])
-        self.Wks = nn.ModuleList([nn.Linear(d_model, self.hs) for _ in range(groups)])
-        self.Wvs = nn.ModuleList([nn.Linear(d_model, self.hs) for _ in range(groups)])
-        self.rope = RotatoryPositionalEncoding(self.hs, block_size)
+        self.Wqs = nn.Linear(d_model, heads  * self.hs) # C, H * hs(C//H)
+        self.Wks = nn.Linear(d_model, groups * self.hs) # C, G * hs
+        self.Wvs = nn.Linear(d_model, groups * self.hs) # C, G * hs
         self.Wo = nn.Linear(heads * self.hs, d_model)
+        self.rope = RotatoryPositionalEncoding(self.hs, block_size)
+        
         self.dropout = nn.Dropout(dropout)
 
-        self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size)))
+        self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size, dtype=bool)))
 
     def forward(self, x):
-        B, T, C = x.shape # Batch, block_size, d_models (B, T, C)
+        B, T, _ = x.shape # Batch, block_size, d_models (B, T, C)
 
-        Q = self.rope(torch.stack([Wq(x) for Wq in self.Wqs]))
-        K = torch.stack([Wk(x) for Wk in self.Wks])
-        V = torch.stack([Wv(x) for Wv in self.Wvs])
+        Q = self.Wqs(x).view(B, T, self.H, self.hs).transpose(1, 2) # B, T, H * hs
+        K = self.Wks(x).view(B, T, self.G, self.hs).transpose(1, 2) # B, T, G * hs
+        V = self.Wvs(x).view(B, T, self.G, self.hs).transpose(1, 2) # B, T, G * hs
 
-        K = self.rope(torch.repeat_interleave(K, self.rps, dim=0))
-        V = torch.repeat_interleave(V, self.rps, dim=0)
+        Q, K = self.rope(Q), self.rope(K)
+        K = K.repeat_interleave(self.rps, dim=1) # (B, T, G*hs) --stacked R(H//G)--> (B, T, G*R*hs) --> 
+        V = V.repeat_interleave(self.rps, dim=1)
 
         score = Q @ K.transpose(-2, -1) / self.hs ** 0.5
         score = score.masked_fill(self.mask[:T,  :T]==0, float("-inf"))
         probs = F.softmax(score, dim=-1)
         out = probs @ V
-        out = out.permute(1, 2, 0, 3).reshape(B, T, -1)
+        out = out.transpose(1, 2).contiguous().reshape(B, T, -1)
         out  = self.dropout(self.Wo(out))
 
         return out
         
-
 
 class FeedForward(nn.Module):
 
@@ -108,6 +111,7 @@ class DecoderTransformerModel(nn.Module):
         self.blocks = nn.Sequential(*[TransformerBlock(d_model, heads, groups, block_size, dropout) for _ in range(n_layers)])
         self.ln = nn.LayerNorm(d_model)
         self.linear = nn.Linear(d_model, vocab_size)
+        
 
         self.apply(self._init_weights)
 
@@ -116,7 +120,7 @@ class DecoderTransformerModel(nn.Module):
             # print(isinstance(module,nn.Linear))
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
-                nn.init.normal_(module.bias, mean=0.0, std=0.02)
+                nn.init.zeros_(module.bias)
 
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -126,13 +130,13 @@ class DecoderTransformerModel(nn.Module):
         out = self.embeddings(x)
         out = self.blocks(out)
         logits = self.linear(self.ln(out))
-        # B, T, C = logits.shape
 
-        # loss = None
-        # accuracy = None
-        # if target:
-        #     loss = F.cross_entropy(logits.view(B * T, -1), target.view(-1))
-        #     accuracy = (logits.argmax(-1) == ys).float().mean()
+        
+        B, T, C = logits.shape
+
+        loss = None
+        if target is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.reshape(-1))
 
             
-        return logits #, loss, accuracy
+        return (logits, loss)
